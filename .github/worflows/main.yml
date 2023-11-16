@@ -1,0 +1,134 @@
+name: dotCMS sync
+
+on: [push]
+
+jobs:
+  sync-with-dotcms:
+    runs-on: ubuntu-latest
+    env:
+      # Global environment expected by dotCMS CLI
+      # This is how we instruct the cli the target server
+      DOT_API_URL: ${{ vars.DOT_API_URL }}
+      # This is how we instruct the cli the target folder in the repo
+      # By default it must be the root of the repo this allows setting up a different folder on top of the root
+      DOT_REPO_BASE_PATH: ${{ vars.DOT_REPO_BASE_PATH }}
+      # This is how we instruct the cli to create the workspace if it does not exist
+      DOT_CREATE_WORKSPACE: ${{ vars.DOT_CREATE_WORKSPACE || 'true' }}
+      # This is the CLI version to use, but we can always override this value
+      DOT_CLI_JAR_DOWNLOAD_URL: ${{ vars.DOT_CLI_JAR_DOWNLOAD_URL || 'https://repo.dotcms.com/artifactory/libs-snapshot-local/com/dotcms/dotcms-cli/1.0.0-SNAPSHOT/dotcms-cli-1.0.0-20231002.205953-1.jar' }}
+      # In case we want to force the download of the CLI jar
+      DOT_FORCE_DOWNLOAD: ${{ vars.DOT_FORCE_DOWNLOAD || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        id: checkout
+        with:
+          fetch-depth: 0
+
+      - name: Load .env file
+        uses: aarcangeli/load-dotenv@v1.0.0
+        with:
+          if-file-not-found: 'warn'
+
+      - name: Print env vars
+        run: |
+          echo "$GITHUB_ENV"
+
+      - name: Get changes
+        id: changed-files
+        run: |
+          echo "changed_files=$(git diff --name-only ${{ github.event.before }} ${{ github.event.after }} | xargs)" >> $GITHUB_OUTPUT
+
+      - name: List changed files
+        run: |
+          for file in ${{ steps.changed-files.outputs.changed_files }}; do
+              echo "$file was changed"
+          done    
+
+      - name: Github Event Context properties
+        run: |
+          echo "Event: ${{ github.event }}"
+          echo "Event Name: ${{ github.event_name }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Commit Ref: ${{ github.ref }}"
+          echo "Head Ref: ${{ github.head_ref }}"
+          echo "Base Ref: ${{ github.base_ref }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "PR: ${{ github.pull_request }}"
+          echo "Workspace: ${{ github.workspace }}"
+
+      - name: Create workspace if not exists
+        id: dot-workspace
+        run: |          
+          if [ ${{ env.DOT_CREATE_WORKSPACE }} = true ]; then
+            echo "Creating workspace ::: "             
+            chmod +x ./.github/workflows/scripts/workspace.sh
+            source ./.github/workflows/scripts/workspace.sh
+            workspace_updated=$(create_workspace "${{github.workspace}}${{env.DOT_REPO_BASE_PATH}}" )          
+            echo "workspace-updated=$workspace_updated" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      # This step requires permission to push to the repo
+      # you need to grant read/write permission for workflows in the repo settings
+      - name: Persist updated workspace
+        run: |
+          saveChanges="${{ steps.dot-workspace.outputs.workspace-updated }}"
+          if [ -n "${saveChanges}" ]; then            
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git add .
+            git commit -m "pushing workspace changes"
+            git push
+            echo "Workspace has been updated."
+          fi
+
+      - name: Options command
+        id: options
+        run: |
+          import os
+
+          # Access environment variables
+
+          PUSH_OPTIONS = {}
+          PUSH_OPTIONS["dry-run"] = os.getenv("DOT_CLI_DRY_RUN")
+          PUSH_OPTIONS["fail-fast"] = os.getenv("DOT_CLI_FAIL_FAST")
+          PUSH_OPTIONS["forceSiteExecution"] = os.getenv("DOT_CLI_FORCE_SITE_EXECUTION")
+          PUSH_OPTIONS["removeAssets"] = os.getenv("DOT_CLI_REMOVE_ASSETS")
+          PUSH_OPTIONS["removeContentTypes"] = os.getenv("DOT_CLI_REMOVE_CONTENT_TYPES")
+          PUSH_OPTIONS["retry-attempts"] = os.getenv("DOT_CLI_RETRY_ATTEMPS")
+          PUSH_OPTIONS["removeFolders"] = os.getenv("DOT_CLI_REMOVE_FOLDERS")
+          PUSH_OPTIONS["removeLanguages"] = os.getenv("DOT_CLI_REMOVE_LANGUAGES")
+          PUSH_OPTIONS["removeSites"] = os.getenv("DOT_CLI_REMOVE_SITES")
+
+          COMMAND_PUSH_OPTS = "";
+
+          for key, value in PUSH_OPTIONS.items():
+              if value != None:
+                  if value.lower() == "true":
+                      COMMAND_PUSH_OPTS=f"{COMMAND_PUSH_OPTS} --{key}"
+                  elif value.lower() != "false":
+                      COMMAND_PUSH_OPTS=f"{COMMAND_PUSH_OPTS} --{key}={value}"
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              print(f 'COMMAND_PUSH_OPTS={COMMAND_PUSH_OPTS}', file=f)
+
+          print(COMMAND_PUSH_OPTS)
+        shell: python
+
+      - name: Run dotCMS CLI
+        id: dot-push
+        run: |                                   
+            chmod +x ./.github/workflows/scripts/run-push.sh
+            source ./.github/workflows/scripts/run-push.sh
+            install_cli "${{env.DOT_CLI_JAR_DOWNLOAD_URL}}" "${{env.DOT_FORCE_DOWNLOAD}}" "${{env.DOT_API_URL}}"
+            run_cli_push "${{github.workspace}}${{env.DOT_REPO_BASE_PATH}}" "${{ steps.options.outputs.COMMAND_PUSH_OPTS }}" "${{ secrets.DOT_TOKEN }}"
+            echo "exit-code=$exit_code" >> "$GITHUB_OUTPUT"
+            print_log
+            if [ $exit_code -ne 0 ]; then
+              echo "Error running dotCMS CLI"
+              exit 1
+            fi
+        shell: bash
